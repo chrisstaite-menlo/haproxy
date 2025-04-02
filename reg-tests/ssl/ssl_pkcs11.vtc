@@ -1,0 +1,56 @@
+#REGTEST_TYPE=devel
+
+# This reg-test uses a dummy PKCS#11 module to load the private key.
+
+varnishtest "Test PKCS#11 support"
+feature cmd "$HAPROXY_PROGRAM -cc 'feature(PKCS11)'"
+feature ignore_unknown_macro
+
+haproxy h1 -conf {
+    global
+        setenv DUMMY_PATH ${testdir}
+        pkcs11-default-driver ${testdir}/../../dev/dummy_pkcs11/dummy_pkcs11.so
+        pkcs11-worker-threads 1
+
+    defaults
+        mode http
+        option httplog
+        log stderr local0 debug err
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    crt-store
+       load crt "${testdir}/common.crt" key "${testdir}/pkcs11_common.key"
+       load crt "${testdir}/ecdsa.crt" key "${testdir}/pkcs11_ecdsa.key"
+
+    listen clear0-lst
+        bind "fd@${clearlst0}"
+        balance roundrobin
+        server s1 "${tmpdir}/ssl0.sock" ssl verify none
+
+    listen clear1-lst
+        bind "fd@${clearlst1}"
+        balance roundrobin
+        server s1 "${tmpdir}/ssl1.sock" ssl verify none
+
+    listen ssl0-lst
+        bind "${tmpdir}/ssl0.sock" ssl crt ${testdir}/common.crt
+        http-request return status 200
+
+    listen ssl1-lst
+        bind "${tmpdir}/ssl1.sock" ssl crt ${testdir}/ecdsa.crt
+        http-request return status 200
+} -start
+
+client c1 -connect ${h1_clearlst0_sock} {
+    txreq
+    rxresp
+    expect resp.status == 200
+} -run
+
+client c1 -connect ${h1_clearlst1_sock} {
+    txreq
+    rxresp
+    expect resp.status == 200
+} -run

@@ -1,0 +1,37 @@
+The PKCS#11 support in HAProxy is designed around the 2.40 synchronous definition
+which requires operations to occur on separate worker threads.  Future
+specifications (3.2+) have yet to be standardised which support asynchronous
+operation.  Therefore, in order to use PKCS#11 within HAProxy a configured number
+of PKCS#11 worker threads have to be defined within the global section of the
+configuration.
+
+In order to shuttle the information between the HAProxy threads and the worker
+threads, requests to perform signing (or RSA X.509 decrypt) create a buffer to
+store the input and output data and then place these in a queue.  This is
+handled by the pkcs11_notify module which ensures that if the task is cancelled
+and freed that the buffers are not freed until the queued task is completed.
+
+Loading of PKCS#11 is performed in the same way as is supported for the latchset
+OpenSSL PKCS#11 engine and provider implementations.  This is through the use of
+a PKCS#11 Provider URI PEM file which takes the place of a PEM private key which
+would ordinarily be loaded into HAProxy.  Parsing of this URI is performed in
+the pkcs11_uri module which uses the specification from RFC7512.  Only information
+that is supported by our implementation is actually loaded from the URI and the
+rest is ignored.
+
+The pkcs11_token module performs the communication with the PKCS#11 library and
+manages the queue of signing (or decryption) operations on the worker threads.
+
+Finally, the pkcs11 module co-ordinates all of this to provide an interface to
+the ssl_chck and ssl_sock modules.  Currently this is through the use of a
+SSL_PRIVATE_KEY_METHOD exposed by BoringSSL and AWS-LC.  It would be easily
+possible to expose an OpenSSL engine for OpenSSL 1 and an OpenSSL provider for
+OpenSSL 3 to use the pkcs11_token module, but since there is already the latchset
+implementations this was not an immediate priority.  WolfTLS already supports
+PKCS#11 natively according to its documentation, but this has not been checked.
+
+To enable the PKCS#11 features the flag USE_PKCS11=1 should be passed to the
+Makefile.
+
+The implementation has been tested with the Google CloudHSM utilising the library
+provided at https://github.com/GoogleCloudPlatform/kms-integrations.

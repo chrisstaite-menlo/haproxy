@@ -33,6 +33,7 @@
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
 #include <haproxy/errors.h>
+#include <haproxy/pkcs11.h>
 #include <haproxy/proxy.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/ssl_ckch.h>
@@ -411,7 +412,7 @@ int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, stru
 
 	}
 
-	if (data->key == NULL) {
+	if (data->key == NULL && data->key_method == NULL) {
 		/* If no private key was found yet and we cannot look for it in extra
 		 * files, raise an error.
 		 */
@@ -436,7 +437,7 @@ int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, stru
 			}
 		}
 
-		if (data->key == NULL) {
+		if (data->key == NULL && data->key_method == NULL) {
 			memprintf(err, "%sNo Private Key found in '%s'.\n", err && *err ? *err : "", fp->area);
 			goto end;
 		}
@@ -454,11 +455,19 @@ int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, stru
 	}
 
 
-	if (!X509_check_private_key(data->cert, data->key)) {
+	if (data->key && !X509_check_private_key(data->cert, data->key)) {
 		memprintf(err, "%sinconsistencies between private key and certificate loaded '%s'.\n",
 		          err && *err ? *err : "", path);
 		goto end;
 	}
+
+#ifdef USE_PKCS11
+	if (data->key_method && !pkcs11_check_private_key(data->cert, data->key_method)) {
+		memprintf(err, "%sinconsistencies between private key and certificate loaded '%s'.\n",
+		          err && *err ? *err : "", path);
+		goto end;
+	}
+#endif
 
 #ifdef HAVE_SSL_SCTL
 	/* try to load the sctl file */
@@ -594,6 +603,9 @@ int ssl_sock_load_key_into_ckch(const char *path, char *buf, struct ckch_data *d
 	int ret = 1;
 	EVP_PKEY *key = NULL;
 	struct passphrase_cb_data cb_data = { path, data, 0, 0 };
+	struct pkcs11_data *key_method = NULL;
+	char *pkcs11_err = NULL;
+	unsigned long read_err;
 
 	if (buf) {
 		/* reading from a buffer */
@@ -628,16 +640,40 @@ int ssl_sock_load_key_into_ckch(const char *path, char *buf, struct ckch_data *d
 	} while (!key && cb_data.passphrase_idx != -1 && cb_data.callback_called);
 
 	if (key == NULL) {
-		unsigned long e = ERR_peek_last_error();
-
-		memprintf(err, "%sunable to load private key from file '%s' (%s).\n",
-		          err && *err ? *err : "", path, ERR_error_string(e, NULL));
-		goto end;
+		read_err = ERR_peek_last_error();
+		if (BIO_reset(in) == -1) {
+			memprintf(err, "%sunable to load private key from file '%s' (%s).\n",
+			          err && *err ? *err : "", path,
+					  ERR_error_string(read_err, NULL));
+			goto end;
+		}
+		goto pkcs11;
 	}
 
 	ret = 0;
 
 	SWAP(data->key, key);
+	goto end;
+
+pkcs11:
+#ifdef USE_PKCS11
+	/* Read PKCS#11 provider */
+	key_method = pkcs11_parse_pem(in, &pkcs11_err);
+#endif /* USE_PKCS11 */
+	if (key_method == NULL) {
+		if (pkcs11_err)
+			memprintf(err, "%sunable to load private key from file '%s': %s.\n",
+			          err && *err ? *err : "", path, pkcs11_err);
+		else
+			memprintf(err, "%sunable to load private key from file '%s' (%s).\n",
+			          err && *err ? *err : "", path,
+					  ERR_error_string(read_err, NULL));
+		goto end;
+	}
+
+	ret = 0;
+
+	SWAP(data->key_method, key_method);
 
 end:
 
@@ -646,6 +682,12 @@ end:
 		BIO_free(in);
 	if (key)
 		EVP_PKEY_free(key);
+#ifdef USE_PKCS11
+	if (key_method)
+		pkcs11_free(key_method);
+#endif /* USE_PKCS11 */
+	if (pkcs11_err)
+		free(pkcs11_err);
 
 	return ret;
 }
@@ -666,6 +708,7 @@ int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *d
 	X509 *ca;
 	X509 *cert = NULL;
 	EVP_PKEY *key = NULL;
+	struct pkcs11_data *key_method = NULL;
 	HASSL_DH *dh = NULL;
 	STACK_OF(X509) *chain = NULL;
 	struct issuer_chain *issuer_chain = NULL;
@@ -707,6 +750,22 @@ int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *d
 		key = PEM_read_bio_PrivateKey(in, NULL, ssl_sock_passwd_cb, &cb_data);
 	} while (!key && cb_data.passphrase_idx != -1 && cb_data.callback_called);
 	/* no need to check for errors here, because the private key could be loaded later */
+
+#ifdef USE_PKCS11
+	/* If the key could not be read, then check it wasn't a PKCS#11 provider */
+	if (key == NULL) {
+		/* Seek back to beginning of file */
+		if (BIO_reset(in) == -1) {
+			memprintf(err, "%san error occurred while reading the file '%s'.\n",
+					  err && *err ? *err : "", path);
+			goto end;
+		}
+
+		/* Read PKCS#11 provider */
+		key_method = pkcs11_parse_pem(in, err);
+		/* no need to check for errors here, because the private key could be loaded later */
+	}
+#endif /* USE_PKCS11 */
 
 #ifndef OPENSSL_NO_DH
 	/* Seek back to beginning of file */
@@ -779,6 +838,7 @@ int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *d
 
 	/* no error, fill data with new context, old context will be free at end: */
 	SWAP(data->key, key);
+	SWAP(data->key_method, key_method);
 	SWAP(data->dh, dh);
 	SWAP(data->cert, cert);
 	SWAP(data->chain, chain);
@@ -793,6 +853,10 @@ end:
 		BIO_free(in);
 	if (key)
 		EVP_PKEY_free(key);
+#ifdef USE_PKCS11
+	if (key_method)
+		pkcs11_free(key_method);
+#endif /* USE_PKCS11 */
 	if (dh)
 		HASSL_DH_free(dh);
 	if (cert)
@@ -819,6 +883,13 @@ void ssl_sock_free_cert_key_and_chain_contents(struct ckch_data *data)
 	if (data->key)
 		EVP_PKEY_free(data->key);
 	data->key = NULL;
+
+#ifdef USE_PKCS11
+	/* Free the key method and set pointer to NULL */
+	if (data->key_method)
+		pkcs11_free(data->key_method);
+	data->key_method = NULL;
+#endif /* USE_PKCS11 */
 
 	/* Free each certificate in the chain */
 	if (data->chain)
@@ -890,6 +961,11 @@ struct ckch_data *ssl_sock_copy_cert_key_and_chain(struct ckch_data *src,
 		dst->key = src->key;
 		EVP_PKEY_up_ref(src->key);
 	}
+
+#ifdef USE_PKCS11
+	if (src->key_method)
+		dst->key_method = pkcs11_dup(src->key_method);
+#endif /* USE_PKCS11 */
 
 	if (src->chain) {
 		dst->chain = X509_chain_up_ref(src->chain);
@@ -2612,7 +2688,7 @@ static int cli_io_handler_dump_cert(struct appctx *appctx)
 	if ((bio = BIO_new(BIO_s_mem())) ==  NULL)
 		goto end_no_putchk;
 
-	if (index == -2) {
+	if (index == -2 && ckchs->data->key) {
 
 		if (BIO_reset(bio) == -1)
 			goto end_no_putchk;
@@ -2631,6 +2707,9 @@ static int cli_io_handler_dump_cert(struct appctx *appctx)
 
 		index++;
 
+	} else if (index == -2) {
+		// TODO: Dump PKCS#11 provider details.
+		index++;
 	}
 
 	if (index == -1) {
@@ -3002,11 +3081,26 @@ static int cli_parse_commit_cert(char **args, char *payload, struct appctx *appc
 		goto error;
 	}
 
+	/* if a certificate is here, a private key must be here too */
+	if (ckchs_transaction.new_ckchs->data->cert && !(ckchs_transaction.new_ckchs->data->key ||
+		                                             ckchs_transaction.new_ckchs->data->key_method)) {
+		memprintf(&err, "The transaction must contain at least a certificate and a private key!\n");
+		goto error;
+	}
+
 	if (ckchs_transaction.new_ckchs->data->key &&
-	    !X509_check_private_key(ckchs_transaction.new_ckchs->data->cert, ckchs_transaction.new_ckchs->data->key)) {
+		!X509_check_private_key(ckchs_transaction.new_ckchs->data->cert, ckchs_transaction.new_ckchs->data->key)) {
 		memprintf(&err, "inconsistencies between private key and certificate loaded '%s'.\n", ckchs_transaction.path);
 		goto error;
 	}
+
+#ifdef USE_PKCS11
+	if (ckchs_transaction.new_ckchs->data->key_method &&
+		!pkcs11_check_private_key(ckchs_transaction.new_ckchs->data->cert, ckchs_transaction.new_ckchs->data->key_method)) {
+		memprintf(&err, "inconsistencies between private key and certificate loaded '%s'.\n", ckchs_transaction.path);
+		goto error;
+	}
+#endif
 
 	/* init the appctx structure */
 	ctx->state = CERT_ST_INIT;

@@ -11814,6 +11814,39 @@ persist rdp-cookie(<name>)
   See also : "balance rdp-cookie", "tcp-request" and the "req.rdp_cookie" ACL.
 
 
+pkcs11-default-driver <driver>
+  If a PKCS#11 URI does not contain a driver module path then this path will
+  be used instead.
+
+  May be used in the following contexts: global
+
+  Arguments :
+    <driver>  the full path to the PKCS#11 driver to use if not specified in the
+              PKCS#11 URI specified in the private key file.
+
+  See also : "pkcs11-worker-threads"
+
+
+pkcs11-worker-threads <count>
+  Allow PKCS#11 private keys to be specified and set the number of threads to
+  use to service communication with the PKCS#11 tokens.  If enabled through the
+  USE_PKCS11 compile-time option, private key PEM files may be of the format
+  PKCS#11 PROVIDER URI which contains a PKCS#11 URI.  Each TLS connection which
+  requires signing operations by this private key will be executed on one of the
+  worker threads specified here.
+
+  If this is not specified and a PKCS#11 private key attempts to load then it
+  will fail.
+
+  May be used in the following contexts: global
+
+  Arguments :
+    <count>    the number of worker threads to use create to service PKCS#11
+               operations.
+
+  See also : "pkcs11-default-driver"
+
+
 quic-initial <action> [ { if | unless } <condition> ]
   Perform an action on an incoming QUIC Initial packet. Contrary to
   "tcp-request connection", this is executed prior to any connection element
@@ -31590,7 +31623,10 @@ domains <string>
 
 key <filename>
   This argument is optional. Load a private key in PEM format. If a private key
-  was already defined in "crt", it will overwrite it.
+  was already defined in "crt", it will overwrite it.  If a private key is
+  specified as a PKCS#11 PROVIDER URI then it will be loaded only if the
+  pkcs11-worker-threads are specified in the global section and with a non-zero
+  value.
 
 ocsp <filename>
   This argument is optional, it loads an OCSP response in DER format. It can

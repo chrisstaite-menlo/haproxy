@@ -62,6 +62,7 @@
 #include <haproxy/log.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/pattern-t.h>
+#include <haproxy/pkcs11.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/proxy.h>
 #include <haproxy/quic_conn.h>
@@ -3029,7 +3030,11 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, struct ckch_store *store
 
 	ERR_clear_error();
 
-	if (SSL_CTX_use_PrivateKey(ctx, data->key) <= 0) {
+	if ((data->key && SSL_CTX_use_PrivateKey(ctx, data->key) <= 0)
+#ifdef USE_PKCS11
+			|| (data->key_method && pkcs11_set_private_key(ctx, data->key_method) <= 0)
+#endif /* USE_PKCS11*/
+			) {
 		int ret;
 
 		ret = ERR_get_error();
@@ -3109,7 +3114,11 @@ static int ssl_sock_put_srv_ckch_into_ctx(const char *path, const struct ckch_da
 	STACK_OF(X509) *find_chain = NULL;
 
 	/* Load the private key */
-	if (SSL_CTX_use_PrivateKey(ctx, data->key) <= 0) {
+	if ((data->key && SSL_CTX_use_PrivateKey(ctx, data->key) <= 0)
+#ifdef USE_PKCS11
+			|| (data->key_method && pkcs11_set_private_key(ctx, data->key_method) <= 0)
+#endif /* USE_PKCS11*/
+			) {
 		memprintf(err, "%sunable to load SSL private key into SSL Context '%s'.\n",
 				err && *err ? *err : "", path);
 		errcode |= ERR_ALERT | ERR_FATAL;
@@ -6190,6 +6199,13 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				TRACE_ERROR("Renegotiate pending: syscall error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code);
 				goto out_error;
 			}
+#if defined(USE_PKCS11) && (defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC))
+			else if (ret == SSL_ERROR_WANT_PRIVATE_KEY_OPERATION) {
+				/* Waiting on a PKCS#11 operation, schedule a retry. */
+				pkcs11_schedule_wakeup(ctx->ssl, &ctx->wait_event);
+				return 0;
+			}
+#endif /* BoringSSL or AWS-LC */
 			else {
 				/* Fail on all other handshake errors */
 				/* Note: OpenSSL may leave unread bytes in the socket's
@@ -6293,6 +6309,13 @@ check_error:
 			goto out_error;
 
 		}
+#if defined(USE_PKCS11) && (defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC))
+		else if (ret == SSL_ERROR_WANT_PRIVATE_KEY_OPERATION) {
+			/* Waiting on a PKCS#11 operation, schedule a retry. */
+			pkcs11_schedule_wakeup(ctx->ssl, &ctx->wait_event);
+			return 0;
+		}
+#endif /* BoringSSL or AWS-LC */
 		else {
 			/* Fail on all other handshake errors */
 			/* Note: OpenSSL may leave unread bytes in the socket's
@@ -7181,6 +7204,14 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 					ctx->error_code = ERR_peek_error();
 				conn->err_code = CO_ER_SSL_FATAL;
 			}
+#if defined(USE_PKCS11) && (defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC))
+			else if (ret == SSL_ERROR_WANT_PRIVATE_KEY_OPERATION) {
+				/* Waiting on a PKCS#11 operation, schedule a retry. */
+				conn->flags |= CO_FL_SSL_WAIT_HS;
+				pkcs11_schedule_wakeup(ctx->ssl, &ctx->wait_event);
+				break;
+			}
+#endif /* BoringSSL or AWS-LC */
 			/* For SSL_ERROR_SYSCALL, make sure to clear the error
 			 * stack before shutting down the connection for
 			 * reading. */
@@ -7408,6 +7439,14 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 				conn->err_code = CO_ER_SSL_FATAL;
 				TRACE_ERROR("tx fatal error", SSL_EV_CONN_SEND|SSL_EV_CONN_ERR, conn, &ctx->error_code);
 			}
+#if defined(USE_PKCS11) && (defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC))
+			else if (ret == SSL_ERROR_WANT_PRIVATE_KEY_OPERATION) {
+				/* Waiting on a PKCS#11 operation, schedule a retry. */
+				conn->flags |= CO_FL_SSL_WAIT_HS;
+				pkcs11_schedule_wakeup(ctx->ssl, &ctx->wait_event);
+				break;
+			}
+#endif /* BoringSSL or AWS-LC */
 			goto out_error;
 		}
 	}

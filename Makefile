@@ -38,6 +38,7 @@
 #   USE_ECH                 : enable use of ECH with the OpenSSL API
 #   USE_QUIC                : enable use of QUIC with the quictls API (quictls, libressl, boringssl)
 #   USE_QUIC_OPENSSL_COMPAT : enable use of QUIC with the standard openssl API (limited features)
+#   USE_PKCS11              : enable support for PKCS#11 with BoringSSL and AWS-LC
 #   USE_ENGINE              : enable use of OpenSSL Engine.
 #   USE_LUA                 : enable Lua support.
 #   USE_ACCEPT4             : enable use of accept4() on linux. Automatic.
@@ -351,7 +352,7 @@ use_opts = USE_EPOLL USE_KQUEUE USE_NETFILTER USE_POLL                        \
            USE_MEMORY_PROFILING USE_SHM_OPEN                                  \
            USE_STATIC_PCRE USE_STATIC_PCRE2                                   \
            USE_PCRE USE_PCRE_JIT USE_PCRE2 USE_PCRE2_JIT                      \
-           USE_QUIC_OPENSSL_COMPAT USE_KTLS
+           USE_QUIC_OPENSSL_COMPAT USE_KTLS USE_PKCS11
 
 # preset all variables for all supported build options among use_opts
 $(reset_opts_vars)
@@ -643,7 +644,10 @@ ifneq ($(USE_OPENSSL:0=),)
   OPTIONS_OBJS += src/ssl_sock.o src/ssl_ckch.o src/ssl_ocsp.o src/ssl_crtlist.o       \
                   src/ssl_sample.o src/cfgparse-ssl.o src/ssl_gencert.o                \
                   src/ssl_utils.o src/jwt.o src/ssl_clienthello.o src/jws.o src/acme.o \
-                  src/ssl_trace.o src/jwe.o
+  ifneq ($(USE_PKCS11:0=),)
+  OPTIONS_OBJS += src/pkcs11.o src/pkcs11-token.o src/pkcs11-uri.o                   \
+                  src/pkcs11-notify.o
+  endif
 endif
 
 ifneq ($(USE_ENGINE:0=),)

@@ -98,6 +98,12 @@ jobs:
     - name: Build WURFL
       if: ${{ contains(matrix.FLAGS, 'USE_WURFL=1') }}
       run: make -C addons/wurfl/dummy
+    - name: Build dummy PKCS#11 module for tests
+      if: ${{ contains(matrix.FLAGS, 'USE_PKCS11=1') }}
+      run: |
+        make -C dev/dummy_pkcs11 \
+          ${{ join(matrix.FLAGS, ' ') }} \
+          ADDLIB="-Wl,-rpath,/usr/local/lib/ -Wl,-rpath,$HOME/opt/lib/"
     - name: Compile HAProxy with ${{ matrix.CC }}
       run: |
         echo "::group::Show compiler's version"

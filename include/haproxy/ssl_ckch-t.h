@@ -49,6 +49,7 @@
 struct ckch_data {
 	X509 *cert;
 	EVP_PKEY *key;
+	struct pkcs11_data *key_method;
 	STACK_OF(X509) *chain;
 	HASSL_DH *dh;
 	struct buffer *sctl;

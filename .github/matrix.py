@@ -264,6 +264,9 @@ def main(ref_name):
             if ssl == "BORINGSSL=yes" or "QUICTLS" in ssl or "LIBRESSL" in ssl or "WOLFSSL" in ssl or "AWS_LC" in ssl or openssl_supports_quic:
                 flags.append("USE_QUIC=1")
 
+            if "AWS_LC" in ssl or ssl == "BORINGSSL=yes":
+                flags.append("USE_PKCS11=1")
+
             matrix.append(
                 {
                     "name": "{}, {}, ssl={}".format(os, CC, clean_ssl(ssl)),
