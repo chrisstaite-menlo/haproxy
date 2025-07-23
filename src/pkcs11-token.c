@@ -200,8 +200,9 @@ out:
 	return out_len;
 }
 
-static void execute_job(struct pkcs11_job *job)
+static int execute_job(struct pkcs11_job *job, int sync)
 {
+	int ret = 0;
 	int max_out = pkcs11_notify_size(job->notify);
 	uint8_t *out = pkcs11_notify_buffer(job->notify);
 	int out_len = 0;
@@ -210,15 +211,22 @@ static void execute_job(struct pkcs11_job *job)
 
 	if (job->type == job_type_sign &&
 			!get_mechanism(job->signature_algorithm, &mechanism)) {
+		/* successfully failed */
+		ret = 1;
 		goto out;
 	}
 	session = get_session(job->token);
 	if (session == NULL) {
-		/* there is at least one session for this token, so re-queue */
-		LIST_INIT(&job->list);
-		pthread_mutex_lock(&global_pkcs11_token.mutex);
-		LIST_APPEND(&global_pkcs11_token.queue, &job->list);
-		pthread_mutex_unlock(&global_pkcs11_token.mutex);
+		if (!sync) {
+			/* there is at least one session for this token, so re-queue */
+			LIST_INIT(&job->list);
+			pthread_mutex_lock(&global_pkcs11_token.mutex);
+			LIST_APPEND(&global_pkcs11_token.queue, &job->list);
+			pthread_mutex_unlock(&global_pkcs11_token.mutex);
+		}
+		/* don't free the job, it's either going to be re-tried or has been
+		 * added back to the queue.
+		 */
 		job = NULL;
 		goto out;
 	}
@@ -230,6 +238,7 @@ static void execute_job(struct pkcs11_job *job)
 		out_len = execute_decrypt(job->token->module->functions, session->session, session->key, job->in, job->in_len, out, max_out);
 		break;
 	}
+	ret = 1;
 
 out:
 	if (session)
@@ -239,14 +248,20 @@ out:
 		pkcs11_token_free(job->token);
 		free(job);
 	}
+	return ret;
 }
 
 static void submit_job(struct pkcs11_job *job)
 {
-	pthread_mutex_lock(&global_pkcs11_token.mutex);
-	LIST_APPEND(&global_pkcs11_token.queue, &job->list);
-	pthread_cond_signal(&global_pkcs11_token.condition);
-	pthread_mutex_unlock(&global_pkcs11_token.mutex);
+	/* If we're running without any worker threads, execute synchronously */
+	if (global_pkcs11_token.thread_count == 0) {
+		while (!execute_job(job, 1)) {}
+	} else {
+		pthread_mutex_lock(&global_pkcs11_token.mutex);
+		LIST_APPEND(&global_pkcs11_token.queue, &job->list);
+		pthread_cond_signal(&global_pkcs11_token.condition);
+		pthread_mutex_unlock(&global_pkcs11_token.mutex);
+	}
 }
 
 static int submit_task(struct pkcs11_token *token, struct pkcs11_notify *notify,
@@ -284,7 +299,7 @@ static void *token_worker_thread(void *arg)
 			if (job) {
 				LIST_DELETE(&job->list);
 				pthread_mutex_unlock(&global_pkcs11_token.mutex);
-				execute_job(job);
+				(void) execute_job(job, 0);
 				pthread_mutex_lock(&global_pkcs11_token.mutex);
 			}
 		}

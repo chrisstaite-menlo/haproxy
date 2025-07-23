@@ -162,6 +162,43 @@ static SSL_PRIVATE_KEY_METHOD pkcs11_provider = {
 };
 #endif  /* BoringSSL, AWS-LC */
 
+#if (OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+static const OSSL_ALGORITHM pkcs11_keymgmt_dispatch[] = {
+	{ "rsa", "" },
+};
+
+static const OSSL_ALGORITHM *pkcs11_query_operation(
+	void *provctx, int operation_id, int *no_cache)
+{
+	OSSL_ALGORITHM *algorithm = NULL;
+    switch (operation_id) {
+    case OSSL_OP_KEYMGMT:
+		algorithm = pkcs11_keymgmt_dispatch;
+    	break;
+    case OSSL_OP_SIGNATURE:
+        break;
+    case OSSL_OP_ASYM_CIPHER:
+        break;
+    }
+    *no_cache = 0;
+    return algorithm;
+}
+
+static const OSSL_DISPATCH pkcs11_dispatch[] = {
+    { OSSL_FUNC_PROVIDER_QUERY_OPERATION,
+	  (void (*)(void))pkcs11_query_operation },
+    { 0, NULL },
+};
+
+int provider_init(const OSSL_CORE_HANDLE *handle,
+                  const OSSL_DISPATCH *in, const OSSL_DISPATCH **out,
+                  void **provctx)
+{
+	*out = pkcs11_dispatch;
+	return RET_OSSL_OK;
+}
+#endif  /* (OPENSSL_VERSION_NUMBER >= 0x3000000fL) */
+
 static void ex_pkcs11_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
 						   int index, long argl, void *argp)
 {
@@ -195,6 +232,22 @@ static int init_data_index(void)
 static int init_pkcs11(void)
 {
 	int ret = ERR_NONE;
+
+#if (OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+	OSSL_PROVIDER *provider = NULL;
+	static const char PROVIDER_NAME[] = "pkcs11";
+	if (OSSL_PROVIDER_add_builtin(NULL, PROVIDER_NAME, &provider_init) <= 0) {
+		ha_alert("pkcs11 : unable to add provider to OpenSSL: %s.\n",
+		         ERR_reason_error_string(ERR_get_error()));
+		goto out;
+	}
+	provider = OSSL_PROVIDER_load(NULL, PROVIDER_NAME);
+	if (provider == NULL) {
+		ha_alert("pkcs11 : unable to load pkcs11 provider after creation: %s.\n",
+		         ERR_reason_error_string(ERR_get_error()));
+		goto out;
+	}
+#endif
 
 	if (global_pkcs11.worker_threads) {
 		ret |= pkcs11_token_init(global_pkcs11.worker_threads);
@@ -259,13 +312,28 @@ struct pkcs11_data *pkcs11_parse_pem(BIO *pem, char **err)
 	struct pkcs11_uri *uri = NULL;
 	struct pkcs11_token *token = NULL;
 
-	/* it is invalid to load a PKCS#11 token when there's no worker threads */
-	if (global_pkcs11.worker_threads == 0)
-		goto out;
 	if (PEM_read_bio(pem, &name, &header, &data, &len) <= 0)
 		goto out;
 	if (strcmp(name, "PKCS#11 PROVIDER URI") != 0)
 		goto out;
+#if (OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+	/* the OpenSSL provider will operate in sync mode, although it's not
+	 * recommended.
+	 */
+#ifdef SSL_MODE_ASYNC
+	if (global_ssl.async == 1 && global_pkcs11.worker_threads == 0) {
+		memprintf(err, "PKCS#11 requires pkcs11-worker-threads to be set "
+		               "with ssl-mode-async");
+		goto out;
+	}
+#endif
+#else
+	/* AWS-LC and BoringSSL both use async operations. */
+	if (global_pkcs11.worker_threads == 0) {
+		memprintf(err, "PKCS#11 requires pkcs11-worker-threads to be set");
+		goto out;
+	}
+#endif
 	ptr = data;
 	parsed_provider = d2i_PROVIDER_URI(NULL, &ptr, len);
 	if (parsed_provider == NULL || ptr != data + len)
@@ -313,12 +381,9 @@ err:
 
 int pkcs11_set_private_key(SSL_CTX *ctx, struct pkcs11_data *key_method)
 {
-#if !defined(OPENSSL_IS_AWSLC) && !defined(OPENSSL_IS_BORINGSSL)
-#error PKCS#11 is not implemented for this TLS framework.
-	return 0;
-#else
 	int ret = 0;
-
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+	/* Implement using the private_key_method */
 	if (!init_data_index())
 		goto out;
 	ret = SSL_CTX_set_ex_data(
@@ -335,10 +400,20 @@ int pkcs11_set_private_key(SSL_CTX *ctx, struct pkcs11_data *key_method)
 	}
 	SSL_CTX_set_private_key_method(ctx, &pkcs11_provider);
 	ret = 1;
-
+#elif (OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+	/* Implement using the provider framework */
+	EVP_PKEY *pkey = NULL;
+	ret = SSL_CTX_use_PrivateKey(ctx, pkey);
+	if (ret <= 0) {
+		ret = 0;
+		goto out;
+	}
+	ret = 1;
+#else
+#error PKCS#11 is not implemented for this TLS framework.
+#endif
 out:
 	return ret;
-#endif
 }
 
 int pkcs11_check_private_key(X509 *cert, struct pkcs11_data *key_method)

@@ -11836,7 +11836,11 @@ pkcs11-worker-threads <count>
   worker threads specified here.
 
   If this is not specified and a PKCS#11 private key attempts to load then it
-  will fail.
+  will fail, unless using OpenSSL 3+ in synchronous mode.  However, this is not
+  recommended.
+
+  If using OpenSSL, it is highly recommended to set ssl-mode-async to ensure
+  that synchronous PKCS#11 operations do not block the IO threads.
 
   May be used in the following contexts: global
 
@@ -11844,7 +11848,7 @@ pkcs11-worker-threads <count>
     <count>    the number of worker threads to use create to service PKCS#11
                operations.
 
-  See also : "pkcs11-default-driver"
+  See also : "pkcs11-default-driver", "ssl-mode-async"
 
 
 quic-initial <action> [ { if | unless } <condition> ]
